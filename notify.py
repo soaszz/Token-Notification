@@ -37,6 +37,12 @@ REMINDER_MINUTES = (60,)      # 15-min reminder via CODEX_REMIND_15=1 (off by de
 # Skip a reminder once fewer seconds remain than the per-interval floor —
 # protects against late/delayed runs sending a misleading "in ~1 hour" ping.
 REMINDER_MIN_REMAINING_SEC = {60: 1200, 15: 180}
+# PC-off reminders may rely on state older than CONFIRMED_FRESH_SEC when the
+# stored reset timestamp is still in the future ("last verified schedule"
+# wording), but never past SCHEDULED_MAX_AGE_SEC (24h): resets roll at most
+# every few hours (5-hour) or week (weekly), so a >24h-old verified timestamp
+# may describe a superseded schedule — a wrong reminder is worse than none.
+# Same 24h cap as PC-off scheduled notifications.
 WINDOWS = ("primary", "secondary")
 
 LABEL_HEAD = {"primary": "Codex 5-Hour", "secondary": "Codex Weekly"}
@@ -71,9 +77,18 @@ def confirmed_text(window: str, resets_at: int) -> str:
     return head + f"\n\nReset time: {ss.format_manila(resets_at)} (Asia/Manila)"
 
 
-def reminder_text(window: str, resets_at: int, minutes: int, used_percent=None) -> str:
+def reminder_text(window: str, resets_at: int, minutes: int, used_percent=None,
+                  verified_at: int | None = None) -> str:
     when = (f"{minutes // 60} hour" if minutes % 60 == 0
             else f"{minutes} minutes")
+    if verified_at is not None:
+        # PC-off / stale state: never claim the schedule is current Codex data.
+        return (
+            f"{LABEL_HEAD[window]} Reset Reminder\n\n"
+            f"Your last reported Codex reset is scheduled in approximately {when}.\n\n"
+            f"Scheduled reset: {ss.format_manila(resets_at)} (Asia/Manila)\n\n"
+            f"This schedule was last verified at {ss.format_manila(verified_at)} (Asia/Manila)."
+        )
     head = (
         f"{LABEL_HEAD[window]} Reset Reminder\n\n"
         f"{REMIND_BODY[window].format(when=when)}\n\n"
@@ -182,9 +197,12 @@ def decide(state: dict, history: dict, now: int,
     Per window:
     - reminder when a future resetsAt is inside the reminder window
       (remaining <= minutes*60 and >= the per-interval floor in
-      REMINDER_MIN_REMAINING_SEC) with usage data no older than
-      CONFIRMED_FRESH_SEC; key reminder:{minutes}:{win}:{resetsAt} makes it
-      at-most-once per reset window, independent of sched/conf.
+      REMINDER_MIN_REMAINING_SEC). Fresh data (<= CONFIRMED_FRESH_SEC) uses
+      current-schedule wording + usage %; moderately stale data
+      (<= SCHEDULED_MAX_AGE_SEC) still reminds with "last verified schedule"
+      wording (verified_at), never past the 24h cap. Key
+      reminder:{minutes}:{win}:{resetsAt} makes it at-most-once per reset
+      window, independent of sched/conf.
     - first observation or unchanged resetsAt in the past (<= now) ->
       at most one "scheduled" notification (PC-off case), skipped when
       state data is older than SCHEDULED_MAX_AGE_SEC.
@@ -200,15 +218,17 @@ def decide(state: dict, history: dict, now: int,
     last_seen = dict(history.get("lastSeen", {}))
     checked = state.get("lastCheckedAt", 0)
 
-    def note(window: str, kind: str, resets_at: int, used_percent=None) -> None:
+    def note(window: str, kind: str, resets_at: int, used_percent=None,
+             verified_at: int | None = None) -> None:
         key = f"{kind}:{window}:{resets_at}"
         if key in sent:
             return
         sent[key] = now
         events.append({"window": window, "kind": kind, "resetsAt": resets_at,
-                       "key": key, "usedPercent": used_percent})
+                       "key": key, "usedPercent": used_percent, "verifiedAt": verified_at})
 
     fresh = isinstance(checked, int) and 0 <= now - checked <= CONFIRMED_FRESH_SEC
+    remindable = isinstance(checked, int) and 0 <= now - checked <= SCHEDULED_MAX_AGE_SEC
 
     for win in WINDOWS:
         w = state.get(win)
@@ -219,12 +239,14 @@ def decide(state: dict, history: dict, now: int,
             continue
         used_percent = w.get("usedPercent")
         remaining = resets - now
-        if fresh and 0 < remaining:
+        if remindable and 0 < remaining:
             for minutes in reminder_minutes:
                 window_sec = minutes * 60
                 floor = REMINDER_MIN_REMAINING_SEC.get(minutes, 300)
                 if window_sec >= remaining >= floor:
-                    note(win, f"reminder:{minutes}", resets, used_percent)
+                    note(win, f"reminder:{minutes}", resets,
+                         used_percent if fresh else None,
+                         None if fresh else checked)
         seen = last_seen.get(win)
         if seen is None or resets == seen:
             last_seen[win] = resets
@@ -250,7 +272,8 @@ def event_text(event: dict) -> str:
     kind = event["kind"]
     if kind.startswith("reminder:"):
         return reminder_text(event["window"], event["resetsAt"],
-                             int(kind.split(":")[1]), event.get("usedPercent"))
+                             int(kind.split(":")[1]), event.get("usedPercent"),
+                             event.get("verifiedAt"))
     if kind == "sched":
         return scheduled_text(event["window"], event["resetsAt"])
     return confirmed_text(event["window"], event["resetsAt"])

@@ -24,6 +24,8 @@ import github_sync
 import state_store as ss
 
 DEFAULT_INTERVAL = 300  # 5 minutes
+HEARTBEAT_SEC = 1800    # refresh codex-state ~every 30 min even when resets are unchanged
+                        # (keeps lastCheckedAt fresh enough for PC-off reminders)
 _LOG_CAP = 256 * 1024
 
 
@@ -112,18 +114,28 @@ def poll_once() -> tuple[dict, str]:
     return state, outcome
 
 
-def maybe_sync(state: dict) -> str:
-    """Push to codex-state branch only when reset-relevant fields changed."""
+def maybe_sync(state: dict, now: int | None = None) -> str:
+    """Push to codex-state on reset change, or on the ~30-minute heartbeat.
+
+    Heartbeat: even when reset timestamps are unchanged, push when the last
+    successful sync is >= HEARTBEAT_SEC old so lastCheckedAt on the branch
+    stays fresh enough for pre-reset reminders. Failed pushes leave the
+    meta timestamp untouched, so the next poll retries. UTC seconds.
+    """
     wins = (state.get("primary") or {}, state.get("secondary") or {})
     if wins[0].get("resetsAt") is None and wins[1].get("resetsAt") is None:
         return "skipped-no-data"
 
+    now = int(now if now is not None else time.time())
     signature = json.dumps(ss.reset_signature(state))
     try:
         meta = json.loads(ss.meta_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
-    if meta.get("signature") == signature:
+    changed = meta.get("signature") != signature
+    last_sync = meta.get("lastSyncAt")
+    heartbeat_due = not isinstance(last_sync, int) or now - last_sync >= HEARTBEAT_SEC
+    if not changed and not heartbeat_due:
         return "skipped-unchanged"
 
     try:
@@ -132,11 +144,12 @@ def maybe_sync(state: dict) -> str:
         log(f"sync failed: {exc}")
         return "error"
     try:
-        ss.meta_path().write_text(json.dumps({"signature": signature}) + "\n", encoding="utf-8")
+        ss.meta_path().write_text(
+            json.dumps({"signature": signature, "lastSyncAt": now}) + "\n", encoding="utf-8")
     except OSError as exc:
         log(f"meta write failed: {exc}")
     if result == "pushed":
-        log("state.json pushed to codex-state")
+        log("state.json pushed to codex-state" + (" (heartbeat)" if not changed else ""))
     return result
 
 

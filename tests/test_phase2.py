@@ -177,10 +177,85 @@ class MissingDataTests(unittest.TestCase):
              "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 111},
              "secondary": None}, checked_at=1)
         sig = json.dumps(ss.reset_signature(state))
-        ss.meta_path().write_text(json.dumps({"signature": sig}), encoding="utf-8")
+        ss.meta_path().write_text(
+            json.dumps({"signature": sig, "lastSyncAt": 100}), encoding="utf-8")
         with mock.patch.object(github_sync, "sync_state") as sync_mock:
-            self.assertEqual(main.maybe_sync(state), "skipped-unchanged")
+            self.assertEqual(main.maybe_sync(state, now=100 + main.HEARTBEAT_SEC - 1),
+                             "skipped-unchanged")
         sync_mock.assert_not_called()
+
+
+class HeartbeatTests(unittest.TestCase):
+    """Heartbeat: refresh codex-state ~every 30 min when resets are unchanged."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ct_hb_"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._old = os.environ.get("CODEX_TRACKER_DIR")
+        os.environ["CODEX_TRACKER_DIR"] = str(self.tmp)
+        self.addCleanup(self._restore)
+        self.state = ss.build_state(
+            {"planType": "edu",
+             "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 111},
+             "secondary": None}, checked_at=200)
+        self.sig = json.dumps(ss.reset_signature(self.state))
+
+    def _restore(self):
+        if self._old is None:
+            os.environ.pop("CODEX_TRACKER_DIR", None)
+        else:
+            os.environ["CODEX_TRACKER_DIR"] = self._old
+
+    def _meta(self, **extra):
+        ss.meta_path().write_text(json.dumps({"signature": self.sig, **extra}),
+                                  encoding="utf-8")
+
+    def test_no_sync_before_heartbeat_interval(self):
+        self._meta(lastSyncAt=1000)
+        with mock.patch.object(github_sync, "sync_state") as sync_mock:
+            result = main.maybe_sync(self.state, now=1000 + main.HEARTBEAT_SEC - 1)
+        self.assertEqual(result, "skipped-unchanged")
+        sync_mock.assert_not_called()
+
+    def test_heartbeat_syncs_after_interval(self):
+        self._meta(lastSyncAt=1000)
+        now = 1000 + main.HEARTBEAT_SEC
+        with mock.patch.object(github_sync, "sync_state", return_value="pushed") as sync_mock:
+            result = main.maybe_sync(self.state, now=now)
+        self.assertEqual(result, "pushed")
+        sync_mock.assert_called_once()
+        meta = json.loads(ss.meta_path().read_text(encoding="utf-8"))
+        self.assertEqual(meta["lastSyncAt"], now)  # UTC seconds
+
+    def test_immediate_sync_on_timestamp_change(self):
+        self._meta(lastSyncAt=999999)  # heartbeat not due
+        changed = ss.build_state(
+            {"planType": "edu",
+             "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 222},
+             "secondary": None}, checked_at=200)
+        with mock.patch.object(github_sync, "sync_state", return_value="pushed") as sync_mock:
+            result = main.maybe_sync(changed, now=1000000)
+        self.assertEqual(result, "pushed")
+        sync_mock.assert_called_once()
+        meta = json.loads(ss.meta_path().read_text(encoding="utf-8"))
+        self.assertEqual(meta["signature"], json.dumps(ss.reset_signature(changed)))
+
+    def test_missing_last_sync_treated_as_due(self):
+        self._meta()  # legacy meta without lastSyncAt
+        with mock.patch.object(github_sync, "sync_state", return_value="pushed"):
+            self.assertEqual(main.maybe_sync(self.state, now=500), "pushed")
+
+    def test_sync_failure_retries_next_poll(self):
+        self._meta(lastSyncAt=1000)
+        now = 1000 + main.HEARTBEAT_SEC
+        with mock.patch.object(github_sync, "sync_state",
+                               side_effect=github_sync.SyncError("boom")):
+            self.assertEqual(main.maybe_sync(self.state, now=now), "error")
+        meta = json.loads(ss.meta_path().read_text(encoding="utf-8"))
+        self.assertEqual(meta["lastSyncAt"], 1000)  # failure leaves meta untouched
+        with mock.patch.object(github_sync, "sync_state", return_value="pushed") as sync_mock:
+            self.assertEqual(main.maybe_sync(self.state, now=now + 300), "pushed")
+        sync_mock.assert_called_once()
 
 
 class DuplicateInstanceTests(unittest.TestCase):

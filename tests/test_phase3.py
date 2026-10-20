@@ -202,9 +202,34 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(self._events(NOW + 60), [])
         self.assertEqual(self._events(PAST_RESET), [])     # already passed
 
-    def test_stale_state_skips_reminder(self):
+    def test_stale_state_uses_last_verified_wording(self):
+        # PC off: state 2h old, reset still in the future -> remind, labeled
         events = self._events(REMIND_RESET, checked_at=NOW - 2 * 3600)
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["usedPercent"])       # no fresh usage claims
+        self.assertEqual(events[0]["verifiedAt"], NOW - 2 * 3600)
+        text = notify.event_text(events[0])
+        self.assertIn("Your last reported Codex reset is scheduled in approximately 1 hour.", text)
+        self.assertIn("This schedule was last verified at", text)
+        self.assertNotIn("Current usage", text)
+        for past_claim in ("has reset", "reached", "arrived"):
+            self.assertNotIn(past_claim, text)
+
+    def test_stale_wording_weekly(self):
+        text = notify.reminder_text("secondary", 1792926804, 60, None,
+                                    verified_at=1792926804 - 7200)
+        self.assertIn("Codex Weekly Reset Reminder", text)
+        self.assertIn("Your last reported Codex reset is scheduled in approximately 1 hour.", text)
+        self.assertIn("This schedule was last verified at", text)
+
+    def test_excessively_stale_state_skips_reminder(self):
+        # >24h old: schedule may have shifted; no reminder beats a wrong one
+        events = self._events(REMIND_RESET, checked_at=NOW - 25 * 3600)
         self.assertEqual(events, [])
+
+    def test_exactly_24h_still_allowed(self):
+        events = self._events(REMIND_RESET, checked_at=NOW - 24 * 3600)
+        self.assertEqual(len(events), 1)
 
     def test_dedup_same_window(self):
         state = make_state(NOW - 60, primary=win(resets=REMIND_RESET))
@@ -471,8 +496,22 @@ class RunCheckTests(BareRepoFixture):
             self.assertEqual(len(sent2), 1)
             self.assertIn("in approximately 15 minutes", sent2[0])
 
-    def test_stale_state_skips_reminder_in_run(self):
+    def test_stale_state_runs(self):
+        # PC-off path: moderately stale state still reminds, once
         self.push_state(make_state(NOW - 7200, primary=win(resets=REMIND_RESET)))
+        sent: list = []
+        code = notify.run_check(self.work, sender=self._recorder(sent), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Your last reported Codex reset", sent[0])
+        self.assertIn("This schedule was last verified at", sent[0])
+        sent2: list = []
+        code2 = notify.run_check(self.work, sender=self._recorder(sent2), now=NOW + 300)
+        self.assertEqual(code2, 0)
+        self.assertEqual(sent2, [])  # duplicate prevention for stale path
+
+    def test_excessively_stale_state_skips_reminder_in_run(self):
+        self.push_state(make_state(NOW - 25 * 3600, primary=win(resets=REMIND_RESET)))
         sent: list = []
         code = notify.run_check(self.work, sender=self._recorder(sent), now=NOW)
         self.assertEqual(code, 0)

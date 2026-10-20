@@ -3,6 +3,9 @@
 # reset window (dedup history lives on the same branch), works while the PC
 # is off. Secrets: repo Actions secrets TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
 # No Codex/ChatGPT credentials are used here by design.
+# Codex reset Telegram notifier. Schedule re-registered 2026-10-20 after the
+# first cron registration produced zero runs (see diagnosis); a push to the
+# default branch re-evaluates GitHub's schedule trigger.
 name: codex-reset-notify
 
 on:

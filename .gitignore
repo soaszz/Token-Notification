@@ -1,0 +1,7 @@
+state.json
+.sync_meta.json
+.tracker.lock
+tracker.log
+tracker.log.old
+__pycache__/
+*.pyc

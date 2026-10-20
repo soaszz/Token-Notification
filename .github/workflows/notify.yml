@@ -1,0 +1,44 @@
+# Codex reset notifications via Telegram (Phase 3).
+# Reads state.json from the codex-state branch, notifies at most once per
+# reset window (dedup history lives on the same branch), works while the PC
+# is off. Secrets: repo Actions secrets TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+# No Codex/ChatGPT credentials are used here by design.
+name: codex-reset-notify
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test Telegram message instead of evaluating resets"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # read codex-state + push notify_history.json (GITHUB_TOKEN only)
+
+# Serializes overlapping runs so reserve-then-send dedup cannot race.
+# false = never cancel a run mid-send; later runs queue behind it.
+concurrency:
+  group: codex-reset-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out notifier code
+        uses: actions/checkout@v4
+
+      - name: Evaluate resets and notify via Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ inputs.test }}" = "true" ]; then
+            python3 notify.py --test
+          else
+            python3 notify.py --check
+          fi

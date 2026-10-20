@@ -33,10 +33,18 @@ HISTORY_FILE = "notify_history.json"
 HISTORY_TTL_SEC = 30 * 86400  # drop sent-keys older than 30 days
 CONFIRMED_FRESH_SEC = 3600    # usage data must be <=1h old to confirm a reset
 SCHEDULED_MAX_AGE_SEC = 86400 # state older than 24h -> too stale to notify
+REMINDER_MINUTES = (60,)      # 15-min reminder via CODEX_REMIND_15=1 (off by default)
+# Skip a reminder once fewer seconds remain than the per-interval floor —
+# protects against late/delayed runs sending a misleading "in ~1 hour" ping.
+REMINDER_MIN_REMAINING_SEC = {60: 1200, 15: 180}
 WINDOWS = ("primary", "secondary")
 
 LABEL_HEAD = {"primary": "Codex 5-Hour", "secondary": "Codex Weekly"}
 LABEL_BODY = {"primary": "5-hour", "secondary": "weekly"}
+REMIND_BODY = {
+    "primary": "Your Codex usage window is scheduled to reset in approximately {when}.",
+    "secondary": "Your weekly Codex allowance is scheduled to reset in approximately {when}.",
+}
 
 
 class TelegramError(RuntimeError):
@@ -61,6 +69,19 @@ def confirmed_text(window: str, resets_at: int) -> str:
         "You can continue using Codex."
     )
     return head + f"\n\nReset time: {ss.format_manila(resets_at)} (Asia/Manila)"
+
+
+def reminder_text(window: str, resets_at: int, minutes: int, used_percent=None) -> str:
+    when = (f"{minutes // 60} hour" if minutes % 60 == 0
+            else f"{minutes} minutes")
+    head = (
+        f"{LABEL_HEAD[window]} Reset Reminder\n\n"
+        f"{REMIND_BODY[window].format(when=when)}\n\n"
+        f"Scheduled reset: {ss.format_manila(resets_at)} (Asia/Manila)"
+    )
+    if used_percent is not None:
+        head += f"\nCurrent usage: {used_percent}%"
+    return head
 
 
 def test_text() -> str:
@@ -154,10 +175,16 @@ def history_bytes(history: dict) -> bytes:
 
 # ---------------------------------------------------------------- decisions
 
-def decide(state: dict, history: dict, now: int) -> tuple[list[dict], dict]:
+def decide(state: dict, history: dict, now: int,
+           reminder_minutes=REMINDER_MINUTES) -> tuple[list[dict], dict]:
     """Return (events, new_history). Pure function; no I/O.
 
     Per window:
+    - reminder when a future resetsAt is inside the reminder window
+      (remaining <= minutes*60 and >= the per-interval floor in
+      REMINDER_MIN_REMAINING_SEC) with usage data no older than
+      CONFIRMED_FRESH_SEC; key reminder:{minutes}:{win}:{resetsAt} makes it
+      at-most-once per reset window, independent of sched/conf.
     - first observation or unchanged resetsAt in the past (<= now) ->
       at most one "scheduled" notification (PC-off case), skipped when
       state data is older than SCHEDULED_MAX_AGE_SEC.
@@ -173,12 +200,15 @@ def decide(state: dict, history: dict, now: int) -> tuple[list[dict], dict]:
     last_seen = dict(history.get("lastSeen", {}))
     checked = state.get("lastCheckedAt", 0)
 
-    def note(window: str, kind: str, resets_at: int) -> None:
+    def note(window: str, kind: str, resets_at: int, used_percent=None) -> None:
         key = f"{kind}:{window}:{resets_at}"
         if key in sent:
             return
         sent[key] = now
-        events.append({"window": window, "kind": kind, "resetsAt": resets_at, "key": key})
+        events.append({"window": window, "kind": kind, "resetsAt": resets_at,
+                       "key": key, "usedPercent": used_percent})
+
+    fresh = isinstance(checked, int) and 0 <= now - checked <= CONFIRMED_FRESH_SEC
 
     for win in WINDOWS:
         w = state.get(win)
@@ -187,6 +217,14 @@ def decide(state: dict, history: dict, now: int) -> tuple[list[dict], dict]:
         resets = w.get("resetsAt")
         if not isinstance(resets, int) or resets <= 0:
             continue
+        used_percent = w.get("usedPercent")
+        remaining = resets - now
+        if fresh and 0 < remaining:
+            for minutes in reminder_minutes:
+                window_sec = minutes * 60
+                floor = REMINDER_MIN_REMAINING_SEC.get(minutes, 300)
+                if window_sec >= remaining >= floor:
+                    note(win, f"reminder:{minutes}", resets, used_percent)
         seen = last_seen.get(win)
         if seen is None or resets == seen:
             last_seen[win] = resets
@@ -209,7 +247,11 @@ def decide(state: dict, history: dict, now: int) -> tuple[list[dict], dict]:
 
 
 def event_text(event: dict) -> str:
-    if event["kind"] == "sched":
+    kind = event["kind"]
+    if kind.startswith("reminder:"):
+        return reminder_text(event["window"], event["resetsAt"],
+                             int(kind.split(":")[1]), event.get("usedPercent"))
+    if kind == "sched":
         return scheduled_text(event["window"], event["resetsAt"])
     return confirmed_text(event["window"], event["resetsAt"])
 
@@ -249,7 +291,10 @@ def run_check(repo, sender=None, branch: str = github_sync.DEFAULT_BRANCH,
         return 0
 
     history = load_history(history_raw)
-    events, new_history = decide(state, history, now)
+    reminder_minutes = list(REMINDER_MINUTES)
+    if os.environ.get("CODEX_REMIND_15", "").strip().lower() in ("1", "true"):
+        reminder_minutes.append(15)
+    events, new_history = decide(state, history, now, tuple(reminder_minutes))
     if not events:
         # No notification due, but remember newly observed reset values so a
         # later roll-forward can still be recognized as a confirmed reset.

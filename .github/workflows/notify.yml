@@ -14,6 +14,10 @@ on:
         description: "Send a test Telegram message instead of evaluating resets"
         type: boolean
         default: false
+      remind15:
+        description: "Also enable the 15-minute pre-reset reminder"
+        type: boolean
+        default: false
 
 permissions:
   contents: write # read codex-state + push notify_history.json (GITHUB_TOKEN only)
@@ -36,6 +40,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CODEX_REMIND_15: ${{ inputs.remind15 }}
         run: |
           if [ "${{ inputs.test }}" = "true" ]; then
             python3 notify.py --test

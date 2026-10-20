@@ -23,7 +23,8 @@ import state_store as ss  # noqa: E402
 
 NOW = 1_800_000_000  # fixed clock for determinism
 PAST_RESET = NOW - 3600
-FUTURE_RESET = NOW + 3600
+FUTURE_RESET = NOW + 7200          # outside every reminder window
+REMIND_RESET = NOW + 3600          # exactly 1h away: 60-min reminder boundary
 
 
 def make_state(checked_at: int, primary=None, secondary=None) -> dict:
@@ -151,6 +152,115 @@ class DecideTests(unittest.TestCase):
         _, new_hist = notify.decide(state, hist, NOW)
         self.assertNotIn("sched:primary:1", new_hist["sent"])
         self.assertIn("sched:primary:2", new_hist["sent"])
+
+
+class ReminderTests(unittest.TestCase):
+    def _events(self, resets: int, checked_at: int | None = None, now: int | None = None,
+                minutes=(60,), used=42):
+        state = make_state(NOW - 60 if checked_at is None else checked_at,
+                           primary=win(used=used, resets=resets))
+        events, _ = notify.decide(state, notify.empty_history(),
+                                  NOW if now is None else now, minutes)
+        return [e for e in events if e["kind"].startswith("reminder")]
+
+    def test_wording_5hour_exact(self):
+        text = notify.reminder_text("primary", 1792515611, 60, 62)
+        self.assertIn("Codex 5-Hour Reset Reminder", text)
+        self.assertIn("Your Codex usage window is scheduled to reset in approximately 1 hour.", text)
+        self.assertIn("Scheduled reset: 2026-10-21 01:00:11 +08:00 (Asia/Manila)", text)
+        self.assertIn("Current usage: 62%", text)
+        for past_claim in ("has reset", "reached", "arrived", "continue using"):
+            self.assertNotIn(past_claim, text)
+
+    def test_wording_weekly_exact(self):
+        text = notify.reminder_text("secondary", 1792926804, 60, None)
+        self.assertIn("Codex Weekly Reset Reminder", text)
+        self.assertIn("Your weekly Codex allowance is scheduled to reset in approximately 1 hour.", text)
+        self.assertIn("Scheduled reset: 2026-10-25 19:13:24 +08:00 (Asia/Manila)", text)
+        self.assertNotIn("Current usage", text)  # no percentage -> line omitted
+
+    def test_wording_15_minutes(self):
+        text = notify.reminder_text("primary", REMIND_RESET, 15)
+        self.assertIn("in approximately 15 minutes.", text)
+
+    def test_key_format(self):
+        events = self._events(REMIND_RESET)
+        self.assertEqual(events[0]["key"], f"reminder:60:primary:{REMIND_RESET}")
+
+    def test_boundary_sends_at_exactly_60min(self):
+        self.assertEqual(len(self._events(REMIND_RESET)), 1)
+
+    def test_boundary_no_early(self):
+        self.assertEqual(self._events(REMIND_RESET + 1), [])
+
+    def test_boundary_sends_at_59_and_21_minutes(self):
+        self.assertEqual(len(self._events(NOW + 59 * 60)), 1)
+        self.assertEqual(len(self._events(NOW + 21 * 60)), 1)  # delayed workflow
+
+    def test_boundary_skips_below_20min_remaining(self):
+        self.assertEqual(self._events(NOW + 19 * 60), [])  # substantially late
+        self.assertEqual(self._events(NOW + 60), [])
+        self.assertEqual(self._events(PAST_RESET), [])     # already passed
+
+    def test_stale_state_skips_reminder(self):
+        events = self._events(REMIND_RESET, checked_at=NOW - 2 * 3600)
+        self.assertEqual(events, [])
+
+    def test_dedup_same_window(self):
+        state = make_state(NOW - 60, primary=win(resets=REMIND_RESET))
+        events1, hist1 = notify.decide(state, notify.empty_history(), NOW)
+        self.assertEqual([e["kind"] for e in events1], ["reminder:60"])
+        events2, _ = notify.decide(state, hist1, NOW + 300)
+        self.assertEqual(events2, [])
+
+    def test_timestamp_change_new_key(self):
+        far = REMIND_RESET + 86400
+        events, hist = notify.decide(
+            make_state(NOW - 60, primary=win(resets=far)),
+            notify.empty_history(), NOW)
+        self.assertEqual(events, [])  # far window: nothing due yet
+        # Backend replaces the window before the old reminder was due
+        state2 = make_state(NOW - 60, primary=win(resets=REMIND_RESET))
+        events2, hist2 = notify.decide(state2, hist, NOW)
+        self.assertEqual([e["key"] for e in events2],
+                         [f"reminder:60:primary:{REMIND_RESET}"])
+        events3, _ = notify.decide(state2, hist2, NOW + 300)
+        self.assertEqual(events3, [])  # abandoned far value never notifies
+
+    def test_15min_off_by_default(self):
+        state = make_state(NOW - 60, primary=win(resets=NOW + 600))  # 10min left
+        events, _ = notify.decide(state, notify.empty_history(), NOW)
+        self.assertEqual(events, [])  # default minutes=(60,) only
+        events2, _ = notify.decide(state, notify.empty_history(), NOW, (60, 15))
+        self.assertEqual([e["kind"] for e in events2], ["reminder:15"])
+
+    def test_15min_boundaries(self):
+        # inside 15-min window and above its 3-min floor: send
+        self.assertEqual(len(self._events(NOW + 400, minutes=(60, 15))), 1)
+        # below 15-min floor (late): skip
+        self.assertEqual(self._events(NOW + 100, minutes=(60, 15)), [])
+        # not yet inside 15-min window: only the 60 fires earlier
+        self.assertEqual([e["kind"] for e in self._events(NOW + 1400, minutes=(60, 15))],
+                         ["reminder:60"])
+
+    def test_both_windows_independent(self):
+        state = make_state(NOW - 60, primary=win(resets=REMIND_RESET),
+                           secondary={"usedPercent": 5,
+                                      "windowDurationMins": 10080,
+                                      "resetsAt": NOW + 45 * 60})
+        events, _ = notify.decide(state, notify.empty_history(), NOW)
+        self.assertEqual(sorted((e["kind"], e["window"]) for e in events),
+                         [("reminder:60", "primary"), ("reminder:60", "secondary")])
+
+    def test_reminder_then_scheduled_compatible(self):
+        hist = notify.empty_history()
+        state = make_state(NOW - 60, primary=win(resets=REMIND_RESET))
+        events, hist = notify.decide(state, hist, NOW)
+        self.assertEqual([e["kind"] for e in events], ["reminder:60"])
+        # Reset passes later -> scheduled notification still fires (separate key)
+        state2 = make_state(REMIND_RESET - 60, primary=win(resets=REMIND_RESET))
+        events2, _ = notify.decide(state2, hist, REMIND_RESET + 300)
+        self.assertEqual([e["kind"] for e in events2], ["sched"])
 
 
 class ValidationTests(unittest.TestCase):
@@ -333,6 +443,41 @@ class RunCheckTests(BareRepoFixture):
         self.assertEqual(len(sent2), 1)
         self.assertIn("Codex 5-Hour Limit Reset", sent2[0])
 
+    def test_reminder_sends_and_dedups_via_branch_history(self):
+        self.push_state(make_state(NOW - 60, primary=win(used=77, resets=REMIND_RESET)))
+        sent: list = []
+        code = notify.run_check(self.work, sender=self._recorder(sent), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Codex 5-Hour Reset Reminder", sent[0])
+        self.assertIn("Current usage: 77%", sent[0])
+        hist = self.read_history()
+        self.assertIn(f"reminder:60:primary:{REMIND_RESET}", hist["sent"])
+        sent2: list = []
+        code2 = notify.run_check(self.work, sender=self._recorder(sent2), now=NOW + 300)
+        self.assertEqual(code2, 0)
+        self.assertEqual(sent2, [])
+
+    def test_remind15_env_opt_in(self):
+        self.push_state(make_state(NOW - 60, primary=win(resets=NOW + 600)))
+        sent: list = []
+        code = notify.run_check(self.work, sender=self._recorder(sent), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(sent, [])  # off by default, even in cloud
+        with mock.patch.dict(os.environ, {"CODEX_REMIND_15": "true"}):
+            sent2: list = []
+            code2 = notify.run_check(self.work, sender=self._recorder(sent2), now=NOW + 30)
+            self.assertEqual(code2, 0)
+            self.assertEqual(len(sent2), 1)
+            self.assertIn("in approximately 15 minutes", sent2[0])
+
+    def test_stale_state_skips_reminder_in_run(self):
+        self.push_state(make_state(NOW - 7200, primary=win(resets=REMIND_RESET)))
+        sent: list = []
+        code = notify.run_check(self.work, sender=self._recorder(sent), now=NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(sent, [])
+
 
 class WorkflowFileTests(unittest.TestCase):
     @classmethod
@@ -357,6 +502,10 @@ class WorkflowFileTests(unittest.TestCase):
     def test_no_codex_credentials_anywhere(self):
         for forbidden in ("auth.json", "codex_app", "OPENAI_API_KEY", "chatgpt"):
             self.assertNotIn(forbidden, self.text)
+
+    def test_remind15_input_wired_to_env(self):
+        self.assertIn("remind15:", self.text)
+        self.assertIn("CODEX_REMIND_15: ${{ inputs.remind15 }}", self.text)
 
 
 class HistoryBytesRoundTripTests(unittest.TestCase):

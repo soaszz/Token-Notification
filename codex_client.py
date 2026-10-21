@@ -15,6 +15,8 @@ import subprocess
 import threading
 import time
 
+from state_store import subprocess_hidden
+
 
 class CodexProbeError(RuntimeError):
     """app-server unreachable, protocol failure, or malformed response."""
@@ -29,6 +31,7 @@ def _spawn():
         text=True,
         encoding="utf-8",
         errors="replace",
+        **subprocess_hidden(),
     )
 
 

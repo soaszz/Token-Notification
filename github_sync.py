@@ -22,7 +22,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from state_store import BASE_DIR
+from state_store import BASE_DIR, subprocess_hidden
 
 STATE_FILENAME = "state.json"
 DEFAULT_BRANCH = "codex-state"
@@ -40,6 +40,7 @@ def _git(repo: Path, *args: str, input_text: str | None = None, check: bool = Tr
         text=True,
         encoding="utf-8",
         errors="replace",
+        **subprocess_hidden(),
     )
     if check and proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-500:]
@@ -88,6 +89,7 @@ def _hash_bytes(repo: Path, data: bytes) -> str:
         ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
         input=data,
         capture_output=True,
+        **subprocess_hidden(),
     )
     if proc.returncode != 0:
         raise SyncError(f"git hash-object failed: {proc.stderr.decode(errors='replace')[-300:]}")
@@ -188,6 +190,7 @@ def read_branch_file(
     raw = subprocess.run(
         ["git", "-C", str(repo), "show", f"{prev}:{filename}"],
         capture_output=True,
+        **subprocess_hidden(),
     )
     if raw.returncode != 0:
         return None

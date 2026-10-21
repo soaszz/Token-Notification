@@ -490,5 +490,51 @@ class CliTests(unittest.TestCase):
         self.assertIn("edu", out)
 
 
+class NoWindowSubprocessTests(unittest.TestCase):
+    """Regression: git/codex children must not flash console windows on Windows."""
+
+    def _assert_hidden(self, kwargs):
+        if os.name == "nt":
+            self.assertEqual(
+                kwargs.get("creationflags"), subprocess.CREATE_NO_WINDOW,
+            )
+            si = kwargs.get("startupinfo")
+            self.assertIsNotNone(si)
+            self.assertTrue(si.dwFlags & subprocess.STARTF_USESHOWWINDOW)
+            self.assertEqual(si.wShowWindow, subprocess.SW_HIDE)
+        else:
+            self.assertEqual(kwargs, {})
+
+    def test_helper_flags(self):
+        self._assert_hidden(ss.subprocess_hidden())
+
+    def test_git_helper_uses_hidden_flags(self):
+        done = mock.Mock(returncode=0, stdout="main\n", stderr="")
+        with mock.patch.object(github_sync.subprocess, "run", return_value=done) as run:
+            github_sync._git(Path("."), "rev-parse", "--abbrev-ref", "HEAD")
+        self._assert_hidden(run.call_args.kwargs)
+
+    def test_git_hash_object_uses_hidden_flags(self):
+        done = mock.Mock(returncode=0, stdout=b"abc\n", stderr=b"")
+        with mock.patch.object(github_sync.subprocess, "run", return_value=done) as run:
+            github_sync._hash_bytes(Path("."), b"x")
+        self._assert_hidden(run.call_args.kwargs)
+
+    def test_git_show_in_read_branch_file_uses_hidden_flags(self):
+        done = mock.Mock(returncode=0, stdout=b"data\n", stderr=b"")
+        with mock.patch.object(github_sync, "remote_branch_sha", return_value="abc123"), \
+             mock.patch.object(github_sync, "_fetch_branch"), \
+             mock.patch.object(github_sync.subprocess, "run", return_value=done) as run:
+            out = github_sync.read_branch_file(Path("."), "state.json")
+        self.assertEqual(out, b"data\n")
+        self.assertIn("show", run.call_args.args[0])
+        self._assert_hidden(run.call_args.kwargs)
+
+    def test_codex_spawn_uses_hidden_flags(self):
+        with mock.patch.object(codex_client.subprocess, "Popen") as popen:
+            codex_client._spawn()
+        self._assert_hidden(popen.call_args.kwargs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

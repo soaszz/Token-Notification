@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,25 @@ from pathlib import Path
 SCHEMA = 1
 MANILA = timezone(timedelta(hours=8))
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def subprocess_hidden() -> dict:
+    """subprocess.run/Popen kwargs that keep background children windowless.
+
+    On Windows a console app spawned from pythonw allocates a visible
+    console window per call (Git windows flickering every tracker poll).
+    CREATE_NO_WINDOW suppresses it; STARTUPINFO/SW_HIDE covers GUI-style
+    launchers. Non-Windows: empty dict (kwargs are Windows-only).
+    """
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": si,
+    }
 
 
 def tracker_dir() -> Path:

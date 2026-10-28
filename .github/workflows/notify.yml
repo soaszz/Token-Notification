@@ -1,32 +1,25 @@
-# Codex reset notifications via Telegram (Phase 3).
-# Reads state.json from the codex-state branch, notifies at most once per
-# reset window (dedup history lives on the same branch), works while the PC
-# is off. Secrets: repo Actions secrets TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
-# No Codex/ChatGPT credentials are used here by design.
-# Codex reset Telegram notifier. Schedule re-registered 2026-10-20 after the
-# first cron registration produced zero runs (see diagnosis); a push to the
-# default branch re-evaluates GitHub's schedule trigger.
+# Confirmation-only Codex reset notifications.
+#
+# Reset notifications require a live authenticated `codex app-server` probe on
+# the local Windows PC. GitHub Actions cannot authenticate to the ChatGPT Edu
+# Codex account, so scheduled cloud notifications based on stored timestamps
+# are disabled. The local tracker confirms renewals from Codex data.
+#
+# This workflow is manual-only: it can send a test message on request and
+# otherwise does nothing. No reset decisions are made from cloud state.
 name: codex-reset-notify
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       test:
-        description: "Send a test Telegram message instead of evaluating resets"
-        type: boolean
-        default: false
-      remind15:
-        description: "Also enable the 15-minute pre-reset reminder"
+        description: "Send a test Telegram message"
         type: boolean
         default: false
 
 permissions:
-  contents: write # read codex-state + push notify_history.json (GITHUB_TOKEN only)
+  contents: read
 
-# Serializes overlapping runs so reserve-then-send dedup cannot race.
-# false = never cancel a run mid-send; later runs queue behind it.
 concurrency:
   group: codex-reset-notify
   cancel-in-progress: false
@@ -34,19 +27,20 @@ concurrency:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Check out notifier code
         uses: actions/checkout@v4
 
-      - name: Evaluate resets and notify via Telegram
+      - name: Send test message
+        if: ${{ inputs.test }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CODEX_REMIND_15: ${{ inputs.remind15 }}
+        run: python3 notify.py --test
+
+      - name: Confirm cloud notifications are disabled
+        if: ${{ !inputs.test }}
         run: |
-          if [ "${{ inputs.test }}" = "true" ]; then
-            python3 notify.py --test
-          else
-            python3 notify.py --check
-          fi
+          echo "Confirmation-only mode: reset notifications require local Codex verification."
+          echo "No reset notification was sent from GitHub Actions."

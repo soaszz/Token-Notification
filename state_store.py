@@ -119,18 +119,21 @@ def load_state(path: Path | None = None) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def write_state(state: dict, path: Path | None = None) -> Path:
-    """Atomic write: temp file in same dir, flush, os.replace."""
-    p = path or state_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+def write_json_atomic(path: Path, value: dict) -> Path:
+    """Atomic JSON write: temp file in same dir, flush, os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, p)
-    return p
+    os.replace(tmp, path)
+    return path
+
+
+def write_state(state: dict, path: Path | None = None) -> Path:
+    return write_json_atomic(path or state_path(), state)
 
 
 def reset_signature(state: dict | None) -> tuple:

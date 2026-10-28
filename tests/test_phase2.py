@@ -287,7 +287,7 @@ class DuplicateInstanceTests(unittest.TestCase):
 
 
 class LocalTrackerNotifyTests(unittest.TestCase):
-    """Tracker loop must invoke the shared notify engine (PC-on delivery)."""
+    """A successful local Codex probe must run reset confirmation."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ct_ltn_"))
@@ -295,6 +295,14 @@ class LocalTrackerNotifyTests(unittest.TestCase):
         self._old = os.environ.get("CODEX_TRACKER_DIR")
         os.environ["CODEX_TRACKER_DIR"] = str(self.tmp)
         self.addCleanup(self._restore)
+        self.probe = {
+            "limitId": "codex",
+            "planType": "edu",
+            "primary": {"usedPercent": 1, "windowDurationMins": 300,
+                        "resetsAt": 1792515611},
+            "secondary": {"usedPercent": 2, "windowDurationMins": 10080,
+                          "resetsAt": 1792926804},
+        }
 
     def _restore(self):
         if self._old is None:
@@ -302,45 +310,42 @@ class LocalTrackerNotifyTests(unittest.TestCase):
         else:
             os.environ["CODEX_TRACKER_DIR"] = self._old
 
-    def _run_loop(self):
-        try:
-            main.cmd_run(interval=1, max_polls=1)
-        finally:
-            main.release_lock()
+    def test_poll_once_confirms_after_ok_probe(self):
+        with mock.patch.object(main.codex_client, "read_rate_limits",
+                               return_value=self.probe), \
+             mock.patch.object(main.notify, "process_local_observation") as confirm:
+            state, outcome = main.poll_once()
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(state["primary"]["resetsAt"], 1792515611)
+        confirm.assert_called_once()
+        self.assertEqual(confirm.call_args[0][0], self.probe)
 
-    def test_run_loop_calls_notify_after_ok_poll(self):
-        state = ss.build_state(
-            {"planType": "edu",
-             "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 111},
-             "secondary": None})
-        with mock.patch.object(main, "poll_once", return_value=(state, "ok")), \
-             mock.patch.object(main, "maybe_sync", return_value="skipped-unchanged"), \
-             mock.patch.object(main.notify, "run_check", return_value=0) as run_mock:
-            self._run_loop()
-        run_mock.assert_called_once()
-        self.assertEqual(run_mock.call_args[0][0], ss.BASE_DIR)
+    def test_failed_probe_skips_confirmation(self):
+        with mock.patch.object(main.codex_client, "read_rate_limits",
+                               side_effect=codex_client.CodexProbeError("down")), \
+             mock.patch.object(main.notify, "process_local_observation") as confirm:
+            state, outcome = main.poll_once()
+        self.assertEqual(outcome, "failed")
+        confirm.assert_not_called()
 
-    def test_notify_failure_does_not_kill_loop(self):
-        state = ss.build_state(
-            {"planType": "edu",
-             "primary": {"usedPercent": 1, "windowDurationMins": 300, "resetsAt": 111},
-             "secondary": None})
+    def test_confirmation_failure_does_not_break_poll(self):
+        with mock.patch.object(main.codex_client, "read_rate_limits",
+                               return_value=self.probe), \
+             mock.patch.object(main.notify, "process_local_observation",
+                               side_effect=RuntimeError("boom")):
+            _, outcome = main.poll_once()  # must not raise
+        self.assertEqual(outcome, "ok")
+
+    def test_tracker_loop_survives_poll(self):
+        state = ss.build_state(self.probe)
         with mock.patch.object(main, "poll_once", return_value=(state, "ok")), \
-             mock.patch.object(main, "maybe_sync", return_value="pushed"), \
-             mock.patch.object(main.notify, "run_check", side_effect=RuntimeError("boom")):
-            self._run_loop()  # must not raise
-        # lock released in finally -> next instance can start
+             mock.patch.object(main, "maybe_sync", return_value="skipped-unchanged"):
+            try:
+                main.cmd_run(interval=1, max_polls=1)
+            finally:
+                main.release_lock()
         self.assertTrue(main.acquire_lock())
         main.release_lock()
-
-    def test_failed_probe_skips_notify(self):
-        state = ss.failure_state(None, "probe down")
-        with mock.patch.object(main, "poll_once", return_value=(state, "failed")), \
-             mock.patch.object(main, "maybe_sync") as sync_mock, \
-             mock.patch.object(main.notify, "run_check") as run_mock:
-            self._run_loop()
-        sync_mock.assert_not_called()
-        run_mock.assert_not_called()
 
 
 class LiveCodexProbeTests(unittest.TestCase):

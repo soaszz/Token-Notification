@@ -102,7 +102,7 @@ def release_lock() -> None:
 # ---------------------------------------------------------------- core ops
 
 def poll_once() -> tuple[dict, str]:
-    """One probe + state write. Returns (state, 'ok'|'failed')."""
+    """One probe + state write + local reset confirmation. Returns (state, status)."""
     try:
         probe = codex_client.read_rate_limits()
         state = ss.build_state(probe)
@@ -112,6 +112,13 @@ def poll_once() -> tuple[dict, str]:
         outcome = "failed"
         log(f"probe failed: {exc}")
     ss.write_state(state)
+    if outcome == "ok":
+        # Confirmation-only path. Only a successful authenticated local probe
+        # can prove a renewal; a failed probe never notifies.
+        try:
+            notify.process_local_observation(probe, ss.tracker_dir(), logger=log)
+        except Exception as exc:  # keep the monitoring loop alive
+            log(f"confirmation error: {exc}")
     return state, outcome
 
 
@@ -227,15 +234,6 @@ def cmd_run(interval: int, max_polls: int) -> int:
                 sync_result = maybe_sync(state)
                 if sync_result not in ("skipped-unchanged", "skipped-no-data"):
                     print(f"sync: {sync_result}")
-                # PC-on delivery path: same notify engine as GitHub Actions so
-                # reminders/resets still go out if cloud cron misfires. Dedup
-                # history on codex-state prevents double sends with the cloud.
-                # ponytail: broad except keeps the monitoring loop alive.
-                try:
-                    if notify.run_check(ss.BASE_DIR):
-                        print("notify: check reported failures (will retry)")
-                except Exception as exc:
-                    print(f"notify: unexpected error: {exc}")
             polls += 1
             if max_polls and polls >= max_polls:
                 break

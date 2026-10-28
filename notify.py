@@ -1,18 +1,20 @@
-"""Telegram notifications for Codex usage-window resets (Phase 3).
+"""Confirmation-only Telegram notifications for Codex usage-window renewals.
 
-Reads state.json from the `codex-state` git branch (single source of truth,
-works identically on the local PC and on a GitHub Actions runner), decides
-whether a scheduled or confirmed reset notification is due, sends via the
-Telegram Bot API (stdlib urllib only), and persists dedup history on the
-same branch (notify_history.json) so each reset window notifies at most once.
+Notifications are sent ONLY when two fresh observations from the authenticated
+local Codex app-server (`codex app-server` -> account/rateLimits/read) prove
+that a usage window renewed. A changed `resetsAt` or a lower `usedPercent`
+alone is never enough.
+
+Scheduled reset pings, 1-hour reminders, and 15-minute reminders are disabled.
+GitHub Actions cannot authenticate to the ChatGPT Edu Codex account, so the
+cloud path never sends reset notifications; confirmation runs locally.
 
 Commands:
   python notify.py --test     send a test message (no state read, no history)
-  python notify.py --check    evaluate resets, notify, update history
+  python notify.py --check    probe Codex locally, confirm renewals, notify
 
-Secrets come ONLY from environment variables TELEGRAM_BOT_TOKEN and
-TELEGRAM_CHAT_ID (GitHub Actions Secrets in the cloud; user env vars locally).
-Tokens are never printed; exception text is scrubbed before display.
+Secrets come ONLY from TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment
+variables. Tokens are never printed; exception text is scrubbed.
 """
 
 from __future__ import annotations
@@ -24,33 +26,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import github_sync
+import codex_client
 import state_store as ss
 
-HISTORY_FILE = "notify_history.json"
-HISTORY_TTL_SEC = 30 * 86400  # drop sent-keys older than 30 days
-CONFIRMED_FRESH_SEC = 3600    # usage data must be <=1h old to confirm a reset
-SCHEDULED_MAX_AGE_SEC = 86400 # state older than 24h -> too stale to notify
-REMINDER_MINUTES = (60,)      # 15-min reminder via CODEX_REMIND_15=1 (off by default)
-# Skip a reminder once fewer seconds remain than the per-interval floor —
-# protects against late/delayed runs sending a misleading "in ~1 hour" ping.
-REMINDER_MIN_REMAINING_SEC = {60: 1200, 15: 180}
-# PC-off reminders may rely on state older than CONFIRMED_FRESH_SEC when the
-# stored reset timestamp is still in the future ("last verified schedule"
-# wording), but never past SCHEDULED_MAX_AGE_SEC (24h): resets roll at most
-# every few hours (5-hour) or week (weekly), so a >24h-old verified timestamp
-# may describe a superseded schedule — a wrong reminder is worse than none.
-# Same 24h cap as PC-off scheduled notifications.
+VERIFIED_FILE = "verified_state.json"
+FRESH_SEC = 3600                 # latest observation must be <=1h old
+WINDOW_DURATION_MINS = {"primary": 300, "secondary": 10080}
+WINDOW_START_TOLERANCE_SEC = 15 * 60   # clock/anchor drift allowance
+MIN_USAGE_DROP_PCT = 10          # a real renewal must visibly free up usage
 WINDOWS = ("primary", "secondary")
 
 LABEL_HEAD = {"primary": "Codex 5-Hour", "secondary": "Codex Weekly"}
 LABEL_BODY = {"primary": "5-hour", "secondary": "weekly"}
-REMIND_BODY = {
-    "primary": "Your Codex usage window is scheduled to reset in approximately {when}.",
-    "secondary": "Your weekly Codex allowance is scheduled to reset in approximately {when}.",
-}
 
 
 class TelegramError(RuntimeError):
@@ -59,44 +48,14 @@ class TelegramError(RuntimeError):
 
 # ---------------------------------------------------------------- messages
 
-def scheduled_text(window: str, resets_at: int) -> str:
-    head = (
-        f"{LABEL_HEAD[window]} Reset Time Reached\n\n"
-        "Your previously reported Codex reset time has arrived.\n\n"
-        "Open Codex to confirm your available usage."
-    )
-    return head + f"\n\nPreviously reported reset: {ss.format_manila(resets_at)} (Asia/Manila)"
-
-
-def confirmed_text(window: str, resets_at: int) -> str:
-    head = (
+def confirmed_text(window: str, used_percent, resets_at: int) -> str:
+    percent = f"{used_percent:g}"
+    return (
         f"{LABEL_HEAD[window]} Limit Reset\n\n"
-        f"Your Codex {LABEL_BODY[window]} usage window has reset.\n\n"
-        "You can continue using Codex."
+        f"Codex has confirmed that your {LABEL_BODY[window]} usage window renewed.\n\n"
+        f"Current usage: {percent}%\n\n"
+        f"Next reported reset: {ss.format_manila(resets_at)} (Asia/Manila)"
     )
-    return head + f"\n\nReset time: {ss.format_manila(resets_at)} (Asia/Manila)"
-
-
-def reminder_text(window: str, resets_at: int, minutes: int, used_percent=None,
-                  verified_at: int | None = None) -> str:
-    when = (f"{minutes // 60} hour" if minutes % 60 == 0
-            else f"{minutes} minutes")
-    if verified_at is not None:
-        # PC-off / stale state: never claim the schedule is current Codex data.
-        return (
-            f"{LABEL_HEAD[window]} Reset Reminder\n\n"
-            f"Your last reported Codex reset is scheduled in approximately {when}.\n\n"
-            f"Scheduled reset: {ss.format_manila(resets_at)} (Asia/Manila)\n\n"
-            f"This schedule was last verified at {ss.format_manila(verified_at)} (Asia/Manila)."
-        )
-    head = (
-        f"{LABEL_HEAD[window]} Reset Reminder\n\n"
-        f"{REMIND_BODY[window].format(when=when)}\n\n"
-        f"Scheduled reset: {ss.format_manila(resets_at)} (Asia/Manila)"
-    )
-    if used_percent is not None:
-        head += f"\nCurrent usage: {used_percent}%"
-    return head
 
 
 def test_text() -> str:
@@ -140,233 +99,237 @@ def telegram_send(token: str, chat_id: str, text: str, timeout: float = 20.0) ->
         raise TelegramError(_redact(f"Telegram rejected the message: {desc}", token))
 
 
-# ---------------------------------------------------------------- state/history
+# ---------------------------------------------------------------- observations
 
-def validate_state(state) -> list[str]:
-    errors: list[str] = []
-    if not isinstance(state, dict):
-        return ["state is not a JSON object"]
-    checked = state.get("lastCheckedAt")
-    if not isinstance(checked, int) or checked < 1_600_000_000:
-        errors.append("lastCheckedAt missing or invalid")
-    if not isinstance(state.get("schema"), int):
-        errors.append("schema missing")
-    for win in WINDOWS:
-        w = state.get(win)
-        if w is None:
-            continue
-        if not isinstance(w, dict):
-            errors.append(f"{win} window is not an object")
-            continue
-        resets = w.get("resetsAt")
-        if resets is not None and (not isinstance(resets, int) or resets <= 0):
-            errors.append(f"{win}.resetsAt invalid")
-    return errors
-
-
-def empty_history() -> dict:
-    return {"schema": 1, "lastSeen": {}, "sent": {}}
-
-
-def load_history(raw: bytes | None) -> dict:
-    if not raw:
-        return empty_history()
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return empty_history()
-    if not isinstance(data, dict):
-        return empty_history()
+def _window(raw, observed_at: int) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
     return {
-        "schema": 1,
-        "lastSeen": data.get("lastSeen") if isinstance(data.get("lastSeen"), dict) else {},
-        "sent": data.get("sent") if isinstance(data.get("sent"), dict) else {},
+        "usedPercent": raw.get("usedPercent"),
+        "windowDurationMins": raw.get("windowDurationMins"),
+        "resetsAt": raw.get("resetsAt"),
+        "observedAt": observed_at,
     }
 
 
-def history_bytes(history: dict) -> bytes:
-    return (json.dumps(history, indent=2, sort_keys=True) + "\n").encode("utf-8")
+def normalize_probe(probe: dict, observed_at: int) -> dict | None:
+    """Normalize a codex_client.read_rate_limits() payload for verification."""
+    if not isinstance(probe, dict):
+        return None
+    return {
+        "schema": 1,
+        "limitId": probe.get("limitId"),
+        "planType": probe.get("planType"),
+        "windows": {
+            "primary": _window(probe.get("primary"), observed_at),
+            "secondary": _window(probe.get("secondary"), observed_at),
+        },
+    }
 
 
-# ---------------------------------------------------------------- decisions
+def empty_verified() -> dict:
+    return {"schema": 1, "limitId": None, "planType": None,
+            "windows": {}, "confirmed": {}}
 
-def decide(state: dict, history: dict, now: int,
-           reminder_minutes=REMINDER_MINUTES) -> tuple[list[dict], dict]:
-    """Return (events, new_history). Pure function; no I/O.
 
-    Per window:
-    - reminder when a future resetsAt is inside the reminder window
-      (remaining <= minutes*60 and >= the per-interval floor in
-      REMINDER_MIN_REMAINING_SEC). Fresh data (<= CONFIRMED_FRESH_SEC) uses
-      current-schedule wording + usage %; moderately stale data
-      (<= SCHEDULED_MAX_AGE_SEC) still reminds with "last verified schedule"
-      wording (verified_at), never past the 24h cap. Key
-      reminder:{minutes}:{win}:{resetsAt} makes it at-most-once per reset
-      window, independent of sched/conf.
-    - first observation or unchanged resetsAt in the past (<= now) ->
-      at most one "scheduled" notification (PC-off case), skipped when
-      state data is older than SCHEDULED_MAX_AGE_SEC.
-    - resetsAt rolled forward past an elapsed old value with fresh usage
-      data (<= CONFIRMED_FRESH_SEC old) -> at most one "confirmed".
-    - early backend window replacement (old value not yet elapsed) ->
-      silent update of lastSeen.
+def load_verified(path: Path) -> dict:
+    """Load persisted verification state. Missing/corrupt -> empty baseline."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return empty_verified()
+    if not isinstance(data, dict):
+        return empty_verified()
+    windows = data.get("windows")
+    confirmed = data.get("confirmed")
+    return {
+        "schema": 1,
+        "limitId": data.get("limitId"),
+        "planType": data.get("planType"),
+        "windows": windows if isinstance(windows, dict) else {},
+        "confirmed": confirmed if isinstance(confirmed, dict) else {},
+    }
+
+
+def _valid_observation(obs, minutes: int) -> bool:
+    if not isinstance(obs, dict):
+        return False
+    if not isinstance(obs.get("resetsAt"), int) or obs["resetsAt"] <= 0:
+        return False
+    if obs.get("windowDurationMins") != minutes:
+        return False
+    if not isinstance(obs.get("observedAt"), int) or obs["observedAt"] <= 0:
+        return False
+    return isinstance(obs.get("usedPercent"), (int, float))
+
+
+def evaluate_renewal(prev: dict, cur: dict, now: int, window: str) -> tuple[bool, str]:
+    """Strong-evidence renewal check for one window.
+
+    Requires: a valid prior observation, a valid current observation, a later
+    resetsAt, the prior reset already elapsed, the current observation inside
+    its own window and fresh, a real usage drop, and a new window start
+    consistent with the old window's expiry. Any ambiguity -> no confirmation.
     """
+    minutes = WINDOW_DURATION_MINS[window]
+    if not _valid_observation(prev, minutes):
+        return False, "no valid prior observation"
+    if not _valid_observation(cur, minutes):
+        return False, "incomplete current observation"
+    if cur["resetsAt"] <= prev["resetsAt"]:
+        return False, "reset timestamp did not roll forward"
+    if prev["resetsAt"] > now:
+        return False, "previous window has not expired"
+    duration = minutes * 60
+    cur_start = cur["resetsAt"] - duration
+    if not (cur_start <= now < cur["resetsAt"]):
+        return False, "observation not inside the current window"
+    if not (-60 <= now - cur["observedAt"] <= FRESH_SEC):
+        return False, "observation is stale"
+    if not (prev["resetsAt"] - duration <= prev["observedAt"] <= prev["resetsAt"] + 60):
+        return False, "prior observation was not a clean baseline"
+    if cur["usedPercent"] >= prev["usedPercent"]:
+        return False, "usage did not decrease"
+    if prev["usedPercent"] - cur["usedPercent"] < MIN_USAGE_DROP_PCT:
+        return False, "usage drop too small to prove renewal"
+    if cur_start < prev["resetsAt"] - WINDOW_START_TOLERANCE_SEC:
+        return False, "new window started before the old one expired"
+    if cur_start > prev["resetsAt"] + duration:
+        return False, "more than one window elapsed; ambiguous history"
+    return True, "confirmed renewal"
+
+
+def _write_verified(path: Path, data: dict) -> None:
+    payload = {
+        "schema": 1,
+        "limitId": data.get("limitId"),
+        "planType": data.get("planType"),
+        "windows": data.get("windows", {}),
+        "confirmed": data.get("confirmed", {}),
+    }
+    ss.write_json_atomic(path, payload)
+
+
+def process_local_observation(probe: dict, tracker_dir: Path | None = None,
+                              sender=None, now: int | None = None,
+                              logger=None) -> list[dict]:
+    """Verify a fresh probe against the last verified observation, notify once.
+
+    Silent baseline on first launch, restart, missing/corrupt state, plan or
+    limit changes, incomplete data, and non-renewal transitions. Sends only
+    confirmed renewals, deduplicated by window + resetsAt.
+    """
+    now = int(now if now is not None else time.time())
+    log = logger or (lambda _msg: None)
+    sender = sender or telegram_send
+    path = Path(tracker_dir or ss.tracker_dir()) / VERIFIED_FILE
+
+    latest = normalize_probe(probe, now)
+    if latest is None:
+        log("confirmation skipped: invalid probe payload")
+        return []
+
+    prev_state = load_verified(path)
+    prev_windows = prev_state.get("windows", {})
+    if prev_windows and (prev_state.get("planType") != latest.get("planType")
+                         or prev_state.get("limitId") != latest.get("limitId")):
+        # Different account/plan/window shape: never compare across it.
+        log("confirmation baseline reset: plan or limit identifier changed")
+        _write_verified(path, {"schema": 1, "limitId": latest.get("limitId"),
+                               "planType": latest.get("planType"),
+                               "windows": {}, "confirmed": prev_state.get("confirmed", {})})
+        prev_state = load_verified(path)
+        prev_windows = {}
+
+    new_windows = dict(prev_windows)
+    confirmed = dict(prev_state.get("confirmed", {}))
     events: list[dict] = []
-    now = int(now)
-    sent = {k: v for k, v in history.get("sent", {}).items()
-            if isinstance(v, int) and now - v < HISTORY_TTL_SEC}
-    last_seen = dict(history.get("lastSeen", {}))
-    checked = state.get("lastCheckedAt", 0)
-
-    def note(window: str, kind: str, resets_at: int, used_percent=None,
-             verified_at: int | None = None) -> None:
-        key = f"{kind}:{window}:{resets_at}"
-        if key in sent:
-            return
-        sent[key] = now
-        events.append({"window": window, "kind": kind, "resetsAt": resets_at,
-                       "key": key, "usedPercent": used_percent, "verifiedAt": verified_at})
-
-    fresh = isinstance(checked, int) and 0 <= now - checked <= CONFIRMED_FRESH_SEC
-    remindable = isinstance(checked, int) and 0 <= now - checked <= SCHEDULED_MAX_AGE_SEC
 
     for win in WINDOWS:
-        w = state.get(win)
-        if not isinstance(w, dict):
+        cur = latest["windows"].get(win)
+        if cur is None:
             continue
-        resets = w.get("resetsAt")
-        if not isinstance(resets, int) or resets <= 0:
+        if not _valid_observation(cur, WINDOW_DURATION_MINS[win]):
+            log(f"confirmation skipped ({win}): incomplete usage data")
             continue
-        used_percent = w.get("usedPercent")
-        remaining = resets - now
-        if remindable and 0 < remaining:
-            for minutes in reminder_minutes:
-                window_sec = minutes * 60
-                floor = REMINDER_MIN_REMAINING_SEC.get(minutes, 300)
-                if window_sec >= remaining >= floor:
-                    note(win, f"reminder:{minutes}", resets,
-                         used_percent if fresh else None,
-                         None if fresh else checked)
-        seen = last_seen.get(win)
-        if seen is None or resets == seen:
-            last_seen[win] = resets
-            if (resets <= now
-                    and f"sched:{win}:{resets}" not in sent
-                    and isinstance(checked, int)
-                    and 0 <= now - checked <= SCHEDULED_MAX_AGE_SEC):
-                note(win, "sched", resets)
-        elif resets > seen:
-            old = seen
-            last_seen[win] = resets
-            if (old <= now
-                    and isinstance(checked, int)
-                    and 0 <= now - checked <= CONFIRMED_FRESH_SEC):
-                note(win, "conf", old)
-        else:
-            last_seen[win] = resets  # backend re-anchored backwards: silent
+        prev = prev_windows.get(win)
+        key = f"conf:{win}:{cur['resetsAt']}"
+        ok, reason = evaluate_renewal(prev, cur, now, win)
+        if ok and key not in confirmed:
+            confirmed[key] = now
+            events.append({"window": win, "usedPercent": cur["usedPercent"],
+                           "resetsAt": cur["resetsAt"], "key": key})
+        elif ok:
+            log(f"confirmation skipped ({win}): already notified for this window")
+        elif prev is not None:
+            log(f"confirmation skipped ({win}): {reason}")
+        new_windows[win] = cur
 
-    return events, {"schema": 1, "lastSeen": last_seen, "sent": sent}
+    reserved = {"schema": 1, "limitId": latest.get("limitId"),
+                "planType": latest.get("planType"),
+                "windows": new_windows, "confirmed": confirmed}
+    try:
+        _write_verified(path, reserved)
+    except OSError as exc:
+        log(f"confirmation skipped: cannot persist verification state ({exc})")
+        return []
 
+    if not events:
+        return []
 
-def event_text(event: dict) -> str:
-    kind = event["kind"]
-    if kind.startswith("reminder:"):
-        return reminder_text(event["window"], event["resetsAt"],
-                             int(kind.split(":")[1]), event.get("usedPercent"),
-                             event.get("verifiedAt"))
-    if kind == "sched":
-        return scheduled_text(event["window"], event["resetsAt"])
-    return confirmed_text(event["window"], event["resetsAt"])
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    failed: list[dict] = []
+    for event in events:
+        try:
+            sender(token, chat_id, confirmed_text(event["window"],
+                                                  event["usedPercent"],
+                                                  event["resetsAt"]))
+            log(f"confirmed reset sent ({event['window']}, resetsAt={event['resetsAt']})")
+        except Exception as exc:
+            log(f"confirmed reset send failed ({event['window']}): {exc}")
+            failed.append(event)
+
+    if failed:
+        for event in failed:
+            confirmed.pop(event["key"], None)
+            if prev_windows.get(event["window"]) is not None:
+                new_windows[event["window"]] = prev_windows[event["window"]]
+            else:
+                new_windows.pop(event["window"], None)
+        try:
+            _write_verified(path, reserved)
+        except OSError as exc:
+            log(f"confirmation rollback failed: {exc}")
+        return []
+
+    return events
 
 
 # ---------------------------------------------------------------- run check
 
-def run_check(repo, sender=None, branch: str = github_sync.DEFAULT_BRANCH,
+def run_check(repo=None, sender=None, branch: str = "codex-state",
               remote: str = "origin", now: int | None = None) -> int:
-    """Full cycle: read state+history from branch, notify, persist history.
+    """Cloud-safe compatibility entry point: never notifies from stored state.
 
-    `sender(token, chat_id, text)` is injectable for tests; defaults to
-    Telegram using environment secrets. Returns process exit code.
+    Reset confirmation requires a live authenticated Codex app-server probe on
+    the local PC. GitHub Actions state/history can therefore never trigger a
+    reset message.
     """
-    sender = sender or telegram_send
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    now = int(now if now is not None else time.time())
+    print("skip: confirmation-only mode; reset notifications require local Codex verification")
+    return 0
 
+
+def run_local_check(sender=None, tracker_dir: Path | None = None,
+                    now: int | None = None) -> int:
     try:
-        state_raw = github_sync.read_branch_file(repo, github_sync.STATE_FILENAME, branch, remote)
-        history_raw = github_sync.read_branch_file(repo, HISTORY_FILE, branch, remote)
-    except github_sync.SyncError as exc:
-        print(f"error: cannot read {branch}: {exc}")
+        probe = codex_client.read_rate_limits()
+    except codex_client.CodexProbeError as exc:
+        print(f"skip: Codex app-server probe failed: {exc}")
         return 1
-
-    if state_raw is None:
-        print(f"skip: no {github_sync.STATE_FILENAME} on branch {branch} yet")
-        return 0
-    try:
-        state = json.loads(state_raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        print("skip: state.json is not valid JSON; not notifying")
-        return 0
-    errors = validate_state(state)
-    if errors:
-        print("skip: invalid state.json (" + "; ".join(errors) + "); not notifying")
-        return 0
-
-    history = load_history(history_raw)
-    reminder_minutes = list(REMINDER_MINUTES)
-    if os.environ.get("CODEX_REMIND_15", "").strip().lower() in ("1", "true"):
-        reminder_minutes.append(15)
-    events, new_history = decide(state, history, now, tuple(reminder_minutes))
-    if not events:
-        # No notification due, but remember newly observed reset values so a
-        # later roll-forward can still be recognized as a confirmed reset.
-        if new_history["lastSeen"] != history.get("lastSeen", {}):
-            try:
-                github_sync.push_files(
-                    {HISTORY_FILE: history_bytes(new_history)},
-                    repo=repo, branch=branch, remote=remote,
-                    commit_msg="codex-state: update observed reset values",
-                )
-            except github_sync.SyncError as exc:
-                print(f"warning: history update push failed: {exc}")
-        print("no notifications due")
-        return 0
-
-    # Reserve dedup keys FIRST (commit history), then send. At-most-once
-    # per window: a crash between reserve and send loses the message rather
-    # than duplicating it; Telegram failures roll the reservation back.
-    try:
-        github_sync.push_files(
-            {HISTORY_FILE: history_bytes(new_history)},
-            repo=repo, branch=branch, remote=remote,
-            commit_msg="codex-state: reserve reset notifications",
-        )
-    except github_sync.SyncError as exc:
-        print(f"error: cannot persist notification history: {exc}")
-        return 1
-
-    failed_keys: list[str] = []
-    for event in events:
-        try:
-            sender(token, chat_id, event_text(event))
-            print(f"sent {event['kind']} ({event['window']}, resetsAt={event['resetsAt']})")
-        except TelegramError as exc:
-            print(f"send failed ({event['kind']} {event['window']}): {exc}")
-            failed_keys.append(event["key"])
-
-    if failed_keys:
-        rollback = {k: v for k, v in new_history["sent"].items() if k not in failed_keys}
-        try:
-            github_sync.push_files(
-                {HISTORY_FILE: history_bytes(
-                    {"schema": 1, "lastSeen": new_history["lastSeen"], "sent": rollback})},
-                repo=repo, branch=branch, remote=remote,
-                commit_msg="codex-state: rollback failed notifications",
-            )
-        except github_sync.SyncError as exc:
-            print(f"warning: rollback push failed: {exc}")
-        return 1
+    process_local_observation(probe, tracker_dir=tracker_dir, sender=sender,
+                              now=now, logger=print)
+    print("local verification complete")
     return 0
 
 
@@ -388,11 +351,11 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--test", action="store_true", help="send a test Telegram message")
     group.add_argument("--check", action="store_true",
-                       help="evaluate codex-state branch and notify if due")
+                       help="verify local Codex usage and notify on a confirmed renewal")
     args = parser.parse_args(argv)
     if args.test:
         return run_test()
-    return run_check(ss.BASE_DIR)
+    return run_local_check()
 
 
 if __name__ == "__main__":

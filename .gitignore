@@ -1,4 +1,5 @@
 state.json
+verified_state.json
 .sync_meta.json
 .tracker.lock
 tracker.log

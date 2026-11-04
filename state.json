@@ -1,10 +1,10 @@
 {
-  "lastCheckedAt": 1793804200,
+  "lastCheckedAt": 1793808559,
   "lastError": null,
   "planType": "edu",
   "primary": {
-    "resetsAt": 1793807022,
-    "usedPercent": 100,
+    "resetsAt": 1793826562,
+    "usedPercent": 0,
     "windowDurationMins": 300
   },
   "schema": 1,
